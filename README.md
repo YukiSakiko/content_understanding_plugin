@@ -45,6 +45,7 @@ uv pip install -r plugins/content_understanding_plugin/requirements.txt
 | `parse.enable_in_private` | `true` | 在私聊中检测到B站链接/卡片时，自动附加AI总结到上下文 |
 | `parse.cache_ttl_seconds` | `1800` | 视频信息缓存时长（秒） |
 | `credential.sessdata` 等 | 空 | 手动填写 Cookie 可代替扫码登录 |
+| `permission.admin_users` | `[]` | 管理员 QQ 白名单（如 `["123456789"]`），填入后仅列表内的 QQ 可执行扫码登录与登出；留空表示不限制 |
 
 扫码登录的凭证持久化在插件数据目录（`data/plugins/<plugin_id>/credential.json`），SDK 不提供写配置能力，因此**不会**写回 `config.toml`。
 

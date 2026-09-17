@@ -86,12 +86,26 @@ class CredentialSectionConfig(PluginConfigBase):
     dedeuserid: str = Field(default="", description="B站 Cookie - DedeUserID")
 
 
+class PermissionSectionConfig(PluginConfigBase):
+    """命令权限配置"""
+
+    __ui_label__ = "权限控制"
+    __ui_icon__ = "shield"
+    __ui_order__ = 3
+
+    admin_users: list[str] = Field(
+        default_factory=list,
+        description='管理员 QQ 白名单列表（如 ["123456789"]）。填入后仅列表内的 QQ 可执行扫码登录/登出；留空表示不限制',
+    )
+
+
 class ContentUnderstandingPluginConfig(PluginConfigBase):
     """插件完整配置"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     parse: ParseSectionConfig = Field(default_factory=ParseSectionConfig)
     credential: CredentialSectionConfig = Field(default_factory=CredentialSectionConfig)
+    permission: PermissionSectionConfig = Field(default_factory=PermissionSectionConfig)
 
 
 # ============ 工具函数 ============
@@ -566,8 +580,44 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         return {"name": "parse_bilibili_video", "content": self._build_tool_content(info)}
 
     # ------------------------------------------------------------------ #
-    # Command: 登录管理
+    # Command: 登录管理与权限控制
     # ------------------------------------------------------------------ #
+
+    def _is_admin(self, user_id: str) -> bool:
+        """检查用户是否在管理员白名单内。未配置任何白名单时允许所有人操作。"""
+        permission_cfg = getattr(self.config, "permission", None)
+        raw_admins = getattr(permission_cfg, "admin_users", []) if permission_cfg else []
+        if not raw_admins:
+            return True  # 列表留空表示不启用白名单限制，所有人可登录
+
+        clean_user = str(user_id or "").strip()
+        if clean_user.lower().startswith("qq:"):
+            clean_user = clean_user[3:].strip()
+        if not clean_user:
+            return False
+
+        for admin in raw_admins:
+            clean_admin = str(admin or "").strip()
+            if clean_admin.lower().startswith("qq:"):
+                clean_admin = clean_admin[3:].strip()
+            if clean_user == clean_admin:
+                return True
+        return False
+
+    @staticmethod
+    def _resolve_sender_id(user_id: str = "", kwargs: Optional[dict[str, Any]] = None) -> str:
+        """从命令调用上下文中提取发送者的 QQ/用户 ID。"""
+        if user_id:
+            return str(user_id).strip()
+        kwargs = kwargs or {}
+        if kwargs.get("user_id"):
+            return str(kwargs["user_id"]).strip()
+        message = kwargs.get("message")
+        if isinstance(message, dict):
+            message_info = message.get("message_info") or {}
+            user_info = message_info.get("user_info") or {}
+            return str(user_info.get("user_id") or "").strip()
+        return ""
 
     @Command(
         "cu_login",
@@ -575,8 +625,14 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         pattern=r"^/cu[_\s]?login\s*$",
         aliases=["/cu登录", "/cu 登录"],
     )
-    async def cmd_login(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+    async def cmd_login(self, stream_id: str = "", user_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
+        sender_id = self._resolve_sender_id(user_id, kwargs)
+        if not self._is_admin(sender_id):
+            msg = f"❌ 权限不足：用户 {sender_id or '未知'} 不在管理员白名单中，无法执行登录操作。"
+            if stream_id:
+                await self.ctx.send.text(msg, stream_id)
+            return False, msg, 2
+
         if not stream_id or self._cred_mgr is None:
             return False, "缺少 stream_id 或插件未就绪", 0
         if self._poll_task is not None and not self._poll_task.done():
@@ -628,8 +684,14 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         pattern=r"^/cu[_\s]?logout\s*$",
         aliases=["/cu登出", "/cu 登出"],
     )
-    async def cmd_logout(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+    async def cmd_logout(self, stream_id: str = "", user_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
+        sender_id = self._resolve_sender_id(user_id, kwargs)
+        if not self._is_admin(sender_id):
+            msg = f"❌ 权限不足：用户 {sender_id or '未知'} 不在管理员白名单中，无法执行登出操作。"
+            if stream_id:
+                await self.ctx.send.text(msg, stream_id)
+            return False, msg, 2
+
         if self._cred_mgr is None:
             return False, "插件未就绪", 0
         message = await self._cred_mgr.clear()
