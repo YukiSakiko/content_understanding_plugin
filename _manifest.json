@@ -2,8 +2,8 @@
   "manifest_version": 2,
   "id": "YukiSakiko.content_understanding_plugin",
   "name": "麦麦视频内容理解插件（B站/抖音）",
-  "version": "2.1.0",
-  "description": "自动识别聊天中的B站与抖音视频链接/分享，获取视频信息、章节要点与官方AI总结并附加到上下文，辅助麦麦更好地参与聊天",
+  "version": "2.1.1",
+  "description": "自动识别聊天中的B站与抖音视频链接/分享，获取视频信息、高光片段、章节要点与官方AI总结并附加到上下文，辅助麦麦更好地参与聊天",
   "author": {
     "name": "YukiSakiko",
     "url": "https://github.com/YukiSakiko"

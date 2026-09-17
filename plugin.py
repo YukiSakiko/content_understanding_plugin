@@ -738,14 +738,73 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
             self.ctx.logger.debug("提取抖音章节要点失败 (%s): %s", vid, exc)
             return None
 
-    async def _fetch_douyin_ai_summary(self, vid: str, cookie_str: str) -> str:
-        """获取抖音官方AI视频总结（图2/3路径：从 AI 搜索流式接口提取）。"""
+    async def _fetch_douyin_pre_generated_summary(
+        self, vid: str, cookie_str: str
+    ) -> Optional[dict[str, Any]]:
+        """获取抖音预生成的官方AI视频总结与高光片段（图8/9路径：即开即用毫秒级响应）。"""
+        assert self._client is not None
+        if not cookie_str:
+            return None
+
+        url = f"https://so-landing.douyin.com/douyin/select/v1/ai/generation/get/?key={vid}&aid=6383"
+        headers = {
+            "User-Agent": _UA,
+            "Cookie": cookie_str,
+            "Referer": "https://so-landing.douyin.com/search_ai_mobile/pc",
+        }
+        try:
+            resp = await self._client.get(url, headers=headers, timeout=10.0)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if data.get("status_code") != 0:
+                return None
+
+            summary = ""
+            highlights: list[dict[str, str]] = []
+            for card in data.get("business_data", []):
+                cid = card.get("card_id")
+                cdata = card.get("data", {})
+                bytesync = cdata.get("bytesync_data", [])
+                if cid == "ai_chat_message_lynx":
+                    tokens = []
+                    for bs in bytesync:
+                        bso = json.loads(bs) if isinstance(bs, str) else bs
+                        disp = bso.get("display", {}) if isinstance(bso, dict) else {}
+                        for span in disp.get("generation_spans", []):
+                            content = span.get("text", {}).get("content")
+                            if content:
+                                tokens.append(content)
+                    summary = _clean_html_tags("".join(tokens))
+                elif cid == "ask_ai_high_light_clip":
+                    for bs in bytesync:
+                        bso = json.loads(bs) if isinstance(bs, str) else bs
+                        if isinstance(bso, dict):
+                            for item in bso.get("data", []):
+                                st = item.get("startTime", 0)
+                                title = item.get("title", "").strip()
+                                if title:
+                                    highlights.append({
+                                        "time": _format_duration(st),
+                                        "title": title,
+                                    })
+            if summary or highlights:
+                return {"summary": summary, "highlights": highlights}
+        except Exception as exc:
+            self.ctx.logger.debug("获取抖音预生成AI总结异常 (%s): %s", vid, exc)
+        return None
+
+    async def _fetch_douyin_ai_summary(
+        self, vid: str, cookie_str: str, title: str = ""
+    ) -> str:
+        """获取抖音官方实时AI视频总结（图2/3路径：从 AI 搜索流式接口提取）。"""
         assert self._client is not None
         if not cookie_str:
             return ""
 
         stream_url = "https://so-landing.douyin.com/douyin/select/v1/ai/stream/"
         device_id = str(random.randint(7000000000000000000, 7999999999999999999))
+        keyword = f"总结当前视频内容：{title.strip()}" if title.strip() else "视频总结"
         params = {
             "count": "5",
             "cursor": "0",
@@ -756,12 +815,12 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
             "need_integration_card": "1",
             "ai_chat_message_use_lynx": "1",
             "version_code": "32.1.0",
-            "enter_method": "click_sug",
+            "enter_method": "offline_summary_card",
             "enter_from": "general_search",
             "search_type": "ai_chat_search",
             "aid": "6383",
             "device_id": device_id,
-            "keyword": "视频总结",
+            "keyword": keyword,
             "ai_search_enter_from_group_id": vid,
             "aweme_id": vid,
         }
@@ -791,13 +850,34 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
                                     tokens.append(text_obj["content"])
                     except Exception:
                         pass
-                return _clean_html_tags("".join(tokens))
+                text = _clean_html_tags("".join(tokens))
+                # 过滤拒答模板，避免将“无法提供总结/信息过于模糊”等废话注入聊天上下文
+                refusal_phrases = (
+                    "无法为您提供",
+                    "无法对您提到",
+                    "无法确定",
+                    "无法总结",
+                    "无法进行总结",
+                    "无法定位",
+                    "根据现有信息，无法",
+                    "根据现有信息，目前无法",
+                    "信息不足",
+                    "过于模糊",
+                    "缺乏可供识别",
+                    "缺乏可识别",
+                    "无法唯一确定",
+                    "建议直接观看",
+                    "建议补充视频",
+                )
+                if any(phrase in text[:150] for phrase in refusal_phrases):
+                    return ""
+                return text
         except Exception as exc:
             self.ctx.logger.debug("获取抖音AI总结流异常 (%s): %s", vid, exc)
             return ""
 
     async def _fetch_douyin_video_info(self, vid: str) -> Optional[dict[str, Any]]:
-        """获取抖音视频信息、章节要点与AI总结（带缓存）。"""
+        """获取抖音视频信息、高光片段、章节要点与AI总结（带缓存）。"""
         cache_key = f"douyin:{vid}"
         now = time.time()
         cached = self._video_cache.get(cache_key)
@@ -821,21 +901,39 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
             "desc": basic_info.get("desc", "")[:200],
             "chapters": [],
             "chapter_abstract": "",
+            "highlights": [],
             "ai_summary": "",
         }
 
-        # 2. 章节要点与 AI 总结
+        # 2. 预生成总结/高光片段、SSR章节要点与实时流式AI总结
         if self.config.parse.enable_ai_summary:
+            # 优先检查官方预生成的 AI 总结与高光片段（毫秒级极速返回，图8/9路径）
+            pre_gen = await self._fetch_douyin_pre_generated_summary(vid, cookie_str)
+            if pre_gen:
+                result["ai_summary"] = pre_gen.get("summary", "")
+                result["highlights"] = pre_gen.get("highlights", [])
+
+            # 并发获取 SSR 章节要点（图1路径）
             chapters_task = asyncio.create_task(self._fetch_douyin_chapters(vid, cookie_str))
-            ai_summary_task = asyncio.create_task(self._fetch_douyin_ai_summary(vid, cookie_str))
+
+            # 若未预生成总结，降级调用流式 AI 总结（图2/3路径）
+            stream_task = None
+            if not result["ai_summary"]:
+                stream_task = asyncio.create_task(
+                    self._fetch_douyin_ai_summary(vid, cookie_str, title=result["title"])
+                )
 
             try:
-                ch_data, summary = await asyncio.gather(chapters_task, ai_summary_task, return_exceptions=True)
+                if stream_task:
+                    ch_data, summary = await asyncio.gather(chapters_task, stream_task, return_exceptions=True)
+                    if isinstance(summary, str) and summary:
+                        result["ai_summary"] = summary
+                else:
+                    ch_data = await chapters_task
+
                 if isinstance(ch_data, dict):
                     result["chapters"] = ch_data.get("list", [])
                     result["chapter_abstract"] = ch_data.get("chapterAbstract", "")
-                if isinstance(summary, str) and summary:
-                    result["ai_summary"] = summary
             except Exception as exc:
                 self.ctx.logger.debug("获取抖音AI总结/章节异常 (%s): %s", vid, exc)
 
@@ -845,15 +943,21 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         return result
 
     def _build_injected_douyin_summary(self, info: dict[str, Any]) -> str:
-        """构建附加到用户消息末尾的抖音视频信息、章节要点与AI总结块。"""
+        """构建附加到用户消息末尾的抖音视频信息、高光片段、章节要点与AI总结块。"""
         title = (info.get("title") or "").strip()
         author = (info.get("author") or "未知创作者").strip()
         duration = _format_duration(info.get("duration", 0))
+        highlights = info.get("highlights") or []
         chapters = info.get("chapters") or []
         chapter_abstract = (info.get("chapter_abstract") or "").strip()
         ai_summary = (info.get("ai_summary") or "").strip()
 
         lines = [f"[抖音视频信息: 《{title}》 | 作者: @{author} | 时长: {duration}]"]
+        if highlights:
+            lines.append("[高光片段]:")
+            for h in highlights:
+                lines.append(f"- {h['time']} {h['title']}")
+
         if chapters:
             lines.append("[抖音章节要点]:")
             if chapter_abstract:
@@ -869,7 +973,7 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
 
         if ai_summary:
             lines.append(f"[抖音官方AI总结]:\n{ai_summary}")
-        elif not chapters and info.get("desc"):
+        elif not chapters and not highlights and info.get("desc"):
             lines.append(f"[视频简介]: {info['desc'].strip()}")
 
         return "\n".join(lines)
@@ -883,6 +987,11 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         ]
         if info.get("desc") and info["desc"] != info.get("title"):
             lines.append(f"简介: {info['desc']}")
+        highlights = info.get("highlights") or []
+        if highlights:
+            lines += ["", "高光片段:"]
+            for h in highlights:
+                lines.append(f"- {h['time']} {h['title']}")
         chapters = info.get("chapters") or []
         chapter_abstract = (info.get("chapter_abstract") or "").strip()
         if chapters:
@@ -896,7 +1005,7 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
                 lines.append(f"- {t} {d}: {det}" if det else f"- {t} {d}")
         if info.get("ai_summary"):
             lines += ["", "抖音官方AI总结:", info["ai_summary"]]
-        elif not chapters:
+        elif not chapters and not highlights:
             lines += ["", "(该视频暂无AI总结或章节，可从标题和简介理解内容)"]
         if info.get("vid"):
             lines.append(f"链接: https://www.douyin.com/video/{info['vid']}")
@@ -1033,9 +1142,9 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
     @Tool(
         "parse_douyin_video",
         description=(
-            "解析抖音视频并获取抖音官方AI视频总结与章节要点。当聊天中出现抖音视频链接、"
+            "解析抖音视频并获取抖音官方AI视频总结、高光片段与章节要点。当聊天中出现抖音视频链接、"
             "v.douyin.com 短链、分享口令文本，或有人提到想了解某个抖音视频内容时，调用此工具获取视频标题、"
-            "作者、时长、章节要点及AI总结，帮助你理解视频内容并参与讨论。"
+            "作者、时长、高光片段、章节要点及官方AI总结，帮助你理解视频内容并参与讨论。"
         ),
         parameters=[
             ToolParameterInfo(

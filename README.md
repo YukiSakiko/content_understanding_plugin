@@ -69,9 +69,10 @@ data = await video.get_ai_conclusion(cid=info["cid"])
 summary = data["model_result"]["summary"]
 ```
 
-### 2. 抖音官方 AI 总结与章节要点
-1. **章节要点**：通过抖音精选页面 SSR 数据提取 `chapterInfo`，获取带时间戳的章节大纲（如 `00:27 规则介绍`）与要点说明。
-2. **AI 视频总结**：通过抖音官方 AI 总结流式接口（`so-landing.douyin.com/douyin/select/v1/ai/stream/`）流式提取针对视频内容的完整结构化解析。
+### 2. 抖音官方 AI 总结、高光片段与章节要点
+1. **预生成 AI 总结与高光片段**：优先请求抖音官方预生成端点（`so-landing.douyin.com/douyin/select/v1/ai/generation/get/`），毫秒级提取字节多模态大模型生成的结构化总结与**带时间戳的高光片段**（如 `02:20 梯度下降解决大模型参数优化难题`）。
+2. **章节要点**：长视频若包含分段大纲，通过抖音精选 SSR 数据提取 `chapterInfo`，获取带时间戳的章节结构（如 `00:27 规则介绍`）与详细说明。
+3. **实时 AI 总结流**：若视频未预生成卡片，自动降级请求抖音官方 AI 总结流式接口（`so-landing.douyin.com/douyin/select/v1/ai/stream/`）实时提炼内容，并智能过滤拒答模板。
 
 ## 文件结构
 
