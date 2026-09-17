@@ -1,0 +1,55 @@
+{
+  "manifest_version": 2,
+  "id": "yukisakiko.content-understanding-plugin",
+  "name": "麦麦b站内容理解插件",
+  "version": "2.0.0",
+  "description": "自动识别聊天中的B站视频链接与小程序卡片，获取视频信息与B站官方AI总结并附加到上下文，辅助麦麦更好地参与聊天",
+  "author": {
+    "name": "YukiSakiko",
+    "url": "https://github.com/YukiSakiko"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/YukiSakiko/content_understanding_plugin"
+  },
+  "host_application": {
+    "min_version": "0.10.0",
+    "max_version": "1.14.5"
+  },
+  "sdk": {
+    "min_version": "2.3.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "bilibili-api-python",
+      "version_spec": ">=17.4.0"
+    },
+    {
+      "type": "python_package",
+      "name": "httpx",
+      "version_spec": ">=0.27.0"
+    },
+    {
+      "type": "python_package",
+      "name": "qrcode",
+      "version_spec": ">=8.0"
+    },
+    {
+      "type": "python_package",
+      "name": "Pillow",
+      "version_spec": ">=10.0.0"
+    }
+  ],
+  "capabilities": [
+    "send.text",
+    "send.image"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}
