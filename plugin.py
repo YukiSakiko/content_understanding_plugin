@@ -1,16 +1,16 @@
-"""B站内容理解插件 - MaiBot SDK v2
+"""视频内容理解插件（B站与抖音） - MaiBot SDK v2
 
-识别聊天中的 B 站视频内容（BV/av 号、bilibili.com 链接、b23.tv 短链），
-获取视频信息与 B 站官方 AI 总结，辅助 bot 更好地参与讨论：
+识别聊天中的 B 站与抖音视频内容（BV/av 号、bilibili.com 链接、b23.tv 短链、抖音链接与口令短链），
+获取视频信息、章节要点与官方 AI 总结，辅助 bot 更好地参与讨论：
 
 - ``chat.receive.after_process`` Hook (BLOCKING):
-  自动检测入站消息中的 B 站链接/卡片，将视频信息与 B 站官方 AI 总结
+  自动检测入站消息中的 B 站或抖音视频链接，将视频信息、章节要点与官方 AI 总结
   直接附加到该消息内容末尾（写入上下文历史），插件**不主动发送任何多余回复**，
   使 bot 在思考和聊天时直接拥有该视频的理解能力。
-- ``parse_bilibili_video`` Tool:
-  供 planner 按需显式解析指定的 B 站视频。
+- ``parse_bilibili_video`` 与 ``parse_douyin_video`` Tool:
+  供 planner 按需显式解析指定的 B 站或抖音视频。
 - ``/cu_login`` ``/cu_status`` ``/cu_logout`` Command:
-  扫码登录 B 站管理（B 站官方 AI 总结接口需登录态）。
+  管理 B 站扫码登录态与查看登录状态。
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import random
 import re
 import time
 from pathlib import Path
@@ -44,7 +45,18 @@ _B23_SHORT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_DOUYIN_SHORT_PATTERN = re.compile(
+    r"(?:https?://)?(?:v|jx)\.douyin\.com/[0-9A-Za-z_\-]+",
+    re.IGNORECASE,
+)
+_DOUYIN_WEB_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.|m\.|iesdouyin\.com/share/|jingxuan\.)?douyin\.com/(?:video|note|share/(?:video|note)|m/(?:video|note))/(\d+)",
+    re.IGNORECASE,
+)
+_DOUYIN_MODAL_PATTERN = re.compile(r"[?&]modal_id=(\d+)", re.IGNORECASE)
+
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+_IOS_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
 
 # ============ 配置模型 ============
 
@@ -67,14 +79,15 @@ class ParseSectionConfig(PluginConfigBase):
     __ui_icon__ = "link"
     __ui_order__ = 1
 
-    enable_ai_summary: bool = Field(default=True, description="获取B站官方AI视频总结（需要扫码登录，部分视频无总结）")
-    enable_in_group: bool = Field(default=True, description="在群聊消息中自动附加B站视频AI总结到上下文")
-    enable_in_private: bool = Field(default=True, description="在私聊消息中自动附加B站视频AI总结到上下文")
+    enable_ai_summary: bool = Field(default=True, description="获取官方AI视频总结（B站/抖音，部分视频无总结）")
+    enable_in_group: bool = Field(default=True, description="在群聊消息中自动附加视频AI总结到上下文")
+    enable_in_private: bool = Field(default=True, description="在私聊消息中自动附加视频AI总结到上下文")
     cache_ttl_seconds: int = Field(default=1800, ge=60, le=86400, description="视频信息缓存时长（秒）")
+    enable_douyin: bool = Field(default=True, description="是否启用抖音视频解析与AI总结/章节要点")
 
 
 class CredentialSectionConfig(PluginConfigBase):
-    """B站登录凭证（可选：手动填写，或使用 /cu_login 扫码登录）"""
+    """登录凭证（B站与抖音）"""
 
     __ui_label__ = "登录凭证"
     __ui_icon__ = "key"
@@ -84,6 +97,10 @@ class CredentialSectionConfig(PluginConfigBase):
     bili_jct: str = Field(default="", description="B站 Cookie - bili_jct")
     buvid3: str = Field(default="", description="B站 Cookie - buvid3")
     dedeuserid: str = Field(default="", description="B站 Cookie - DedeUserID")
+    douyin_cookie: str = Field(
+        default="",
+        description="抖音 Cookie（选填：用于获取抖音AI总结与章节要点）",
+    )
 
 
 class PermissionSectionConfig(PluginConfigBase):
@@ -143,6 +160,35 @@ def _extract_ai_summary(data: Any) -> str:
     model_result = result.get("model_result") or {}
     summary = model_result.get("summary") if isinstance(model_result, dict) else ""
     return str(summary or "").strip()
+
+
+def _clean_html_tags(text: str) -> str:
+    """清理返回文本中的 HTML 标签（如 <mark> 等）"""
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def _parse_cookie_text(text: str) -> dict[str, str]:
+    """解析 Cookie 文本，自动兼容 Netscape 制表符格式与分号键值对格式。"""
+    res: dict[str, str] = {}
+    text = (text or "").strip()
+    if not text:
+        return res
+    if "# Netscape" in text or "\t" in text:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                res[parts[5].strip()] = parts[6].strip()
+            elif len(parts) == 2:
+                res[parts[0].strip()] = parts[1].strip()
+    else:
+        for item in text.split(";"):
+            if "=" in item:
+                k, v = item.strip().split("=", 1)
+                res[k.strip()] = v.strip()
+    return res
 
 
 # ============ 凭证管理 ============
@@ -293,11 +339,96 @@ class CredentialManager:
         return "✅ 已登出并清除本地凭证"
 
 
+class DouyinCookieManager:
+    """抖音 Cookie 与凭据管理：支持配置与本地凭据文件。
+
+    并在缺少 ttwid 时自动请求字节跳动游客注册接口获取匿名 ttwid。
+    """
+
+    TTWID_REGISTER_URL = "https://ttwid.bytedance.com/ttwid/union/register/"
+    TTWID_REGISTER_BODY = {
+        "region": "cn",
+        "aid": 1768,
+        "needFid": False,
+        "service": "www.ixigua.com",
+        "migrate_info": {"ticket": "", "source": "node"},
+        "cbUrlProtocol": "https",
+        "union": True,
+    }
+
+    def __init__(self, data_dir: Path, cookie_config: CredentialSectionConfig, client: httpx.AsyncClient):
+        self._data_dir = data_dir
+        self._cookie_config = cookie_config
+        self._client = client
+        self._cookie_file = data_dir / "douyin_cookies.txt"
+        self._cookie_dict: dict[str, str] = {}
+        self._cached_cookie_str = ""
+        self.reload()
+
+    def reload(self) -> None:
+        """重新加载并更新抖音 Cookie。"""
+        merged: dict[str, str] = {}
+
+        # 1. 本地持久化文件加载
+        if self._cookie_file.exists():
+            try:
+                merged.update(_parse_cookie_text(self._cookie_file.read_text(encoding="utf-8")))
+            except Exception:
+                pass
+
+        # 2. 插件配置覆盖
+        if self._cookie_config.douyin_cookie.strip():
+            merged.update(_parse_cookie_text(self._cookie_config.douyin_cookie))
+
+        self._cookie_dict = merged
+        if self._cookie_dict:
+            self._cached_cookie_str = "; ".join(f"{k}={v}" for k, v in self._cookie_dict.items())
+            try:
+                self._cookie_file.parent.mkdir(parents=True, exist_ok=True)
+                self._cookie_file.write_text(self._cached_cookie_str, encoding="utf-8")
+            except Exception:
+                pass
+        else:
+            self._cached_cookie_str = ""
+
+    def get_cookie_str(self) -> str:
+        """获取当前抖音 Cookie 字符串。"""
+        return self._cached_cookie_str
+
+    async def ensure_ttwid(self) -> None:
+        """确保持有 ttwid，缺失时向字节注册接口获取一次。"""
+        if self._cookie_dict.get("ttwid"):
+            return
+        try:
+            resp = await self._client.post(
+                self.TTWID_REGISTER_URL,
+                json=self.TTWID_REGISTER_BODY,
+                headers={"User-Agent": _IOS_UA, "Content-Type": "application/json"},
+            )
+            ttwid = resp.cookies.get("ttwid")
+            if not ttwid:
+                for c_header in resp.headers.get_list("set-cookie"):
+                    if "ttwid=" in c_header:
+                        m = re.search(r"ttwid=([^;]+)", c_header)
+                        if m:
+                            ttwid = m.group(1)
+                            break
+            if ttwid:
+                self._cookie_dict["ttwid"] = ttwid
+                self._cached_cookie_str = "; ".join(f"{k}={v}" for k, v in self._cookie_dict.items())
+                try:
+                    self._cookie_file.write_text(self._cached_cookie_str, encoding="utf-8")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
 # ============ 插件主类 ============
 
 
 class ContentUnderstandingPlugin(MaiBotPlugin):
-    """B站内容理解插件"""
+    """视频内容理解插件（B站与抖音）"""
 
     config_model = ContentUnderstandingPluginConfig
 
@@ -305,6 +436,7 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         super().__init__()
         self._client: Optional[httpx.AsyncClient] = None
         self._cred_mgr: Optional[CredentialManager] = None
+        self._douyin_cred_mgr: Optional[DouyinCookieManager] = None
         self._poll_task: Optional[asyncio.Task[None]] = None
         self._video_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
@@ -321,9 +453,11 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         data_dir = Path(self.ctx.paths.data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
         self._cred_mgr = CredentialManager(data_dir, self.config.credential, self._client)
+        self._douyin_cred_mgr = DouyinCookieManager(data_dir, self.config.credential, self._client)
         self.ctx.logger.info(
-            "content_understanding_plugin 已加载 (ai_summary=%s, in_group=%s, in_private=%s)",
+            "content_understanding_plugin 已加载 (ai_summary=%s, douyin=%s, in_group=%s, in_private=%s)",
             self.config.parse.enable_ai_summary,
+            self.config.parse.enable_douyin,
             self.config.parse.enable_in_group,
             self.config.parse.enable_in_private,
         )
@@ -341,6 +475,8 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         self.ctx.logger.info("配置已更新 (scope=%s, version=%s)", scope, version)
         if self._cred_mgr is not None:
             self._cred_mgr.invalidate_cache()
+        if self._douyin_cred_mgr is not None:
+            self._douyin_cred_mgr.reload()
         self._video_cache.clear()
 
     # ------------------------------------------------------------------ #
@@ -351,8 +487,9 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         """从文本解析视频目标。
 
         Returns:
-            (\"bvid\", str) 或 (\"aid\", int)；无法识别时返回 None。
+            ("bvid", str) | ("aid", int) | ("douyin", str)；无法识别时返回 None。
         """
+        # 1. B站视频识别
         match = _BILI_VIDEO_URL_PATTERN.search(text) or _BV_PATTERN.search(text)
         if match:
             token = match.group(0)
@@ -366,6 +503,7 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         match = _AV_PATTERN.search(text)
         if match:
             return "aid", int(match.group(1))
+
         # b23.tv / bili2233.cn 短链：跟随重定向后再提取
         for short in _B23_SHORT_PATTERN.findall(text):
             if not short.startswith("http"):
@@ -382,10 +520,41 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
                     if pattern is _AV_PATTERN:
                         return "aid", int(m.group(1))
                     return "bvid", m.group(1)
+
+        # 2. 抖音视频识别
+        # modal_id 参数
+        m = _DOUYIN_MODAL_PATTERN.search(text)
+        if m:
+            return "douyin", m.group(1)
+
+        # 直链 (video/xxx, note/xxx, share/xxx)
+        m = _DOUYIN_WEB_PATTERN.search(text)
+        if m:
+            return "douyin", m.group(1)
+
+        # 短链 (v.douyin.com, jx.douyin.com)
+        for short in _DOUYIN_SHORT_PATTERN.findall(text):
+            if not short.startswith("http"):
+                short = f"https://{short}"
+            try:
+                assert self._client is not None
+                resp = await self._client.get(short, headers={"User-Agent": _IOS_UA})
+                final_url = str(resp.url)
+            except Exception:
+                continue
+            for pat in (_DOUYIN_MODAL_PATTERN, _DOUYIN_WEB_PATTERN):
+                m = pat.search(final_url)
+                if m:
+                    return "douyin", m.group(1)
+
         return None
 
+    # ------------------------------------------------------------------ #
+    # B站视频处理
+    # ------------------------------------------------------------------ #
+
     async def _fetch_video_info(self, kind: str, vid: Any) -> Optional[dict[str, Any]]:
-        """获取视频信息 + AI 总结（带缓存）。失败返回 None。"""
+        """获取 B 站视频信息 + AI 总结（带缓存）。失败返回 None。"""
         cache_key = f"{kind}:{vid}"
         now = time.time()
         cached = self._video_cache.get(cache_key)
@@ -397,7 +566,7 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         try:
             info = await video.get_info()
         except Exception as exc:
-            self.ctx.logger.warning("获取视频信息失败 (%s=%s): %s", kind, vid, exc)
+            self.ctx.logger.warning("获取B站视频信息失败 (%s=%s): %s", kind, vid, exc)
             return None
 
         stat = info.get("stat") or {}
@@ -424,7 +593,7 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
                     data = await video_with_cred.get_ai_conclusion(cid=info.get("cid"))
                     result["ai_summary"] = _extract_ai_summary(data)
                 except Exception as exc:
-                    self.ctx.logger.debug("获取 AI 总结失败 (%s): %s", result["bvid"], exc)
+                    self.ctx.logger.debug("获取 B 站 AI 总结失败 (%s): %s", result["bvid"], exc)
 
         if len(self._video_cache) > 100:
             self._video_cache.clear()
@@ -446,7 +615,7 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         return "\n".join(lines)
 
     def _build_tool_content(self, info: dict[str, Any]) -> str:
-        """构建返回给 planner 的 Tool 内容。"""
+        """构建返回给 planner 的 B 站 Tool 内容。"""
         lines = [
             f"标题: {info['title']}",
             f"UP主: {info['up']}",
@@ -464,13 +633,283 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
+    # 抖音视频处理 (章节要点 + 官方AI总结)
+    # ------------------------------------------------------------------ #
+
+    async def _fetch_douyin_basic_info(self, vid: str, cookie_str: str) -> Optional[dict[str, Any]]:
+        """获取抖音视频基础信息（标题、作者、时长）。"""
+        assert self._client is not None
+        urls = (
+            f"https://www.iesdouyin.com/share/video/{vid}",
+            f"https://m.douyin.com/share/video/{vid}",
+        )
+        headers = {
+            "User-Agent": _IOS_UA,
+            "Referer": "https://www.douyin.com/",
+        }
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+
+        for url in urls:
+            try:
+                resp = await self._client.get(url, headers=headers, follow_redirects=True)
+                if resp.status_code != 200:
+                    continue
+                m = re.search(r"window\._ROUTER_DATA\s*=\s*(.*?)</script>", resp.text, re.DOTALL)
+                if not m:
+                    continue
+                data = json.loads(m.group(1).strip())
+                loader = data.get("loaderData", {})
+                page = loader.get("video_(id)/page") or loader.get("note_(id)/page") or {}
+                item_list = page.get("videoInfoRes", {}).get("item_list", [])
+                if not item_list:
+                    continue
+                item = item_list[0]
+                dur = (item.get("video") or {}).get("duration", 0)
+                duration_sec = (dur // 1000) if dur > 1000 else dur
+                return {
+                    "title": item.get("desc", ""),
+                    "author": (item.get("author") or {}).get("nickname", "未知创作者"),
+                    "duration": duration_sec,
+                    "desc": item.get("desc", ""),
+                }
+            except Exception as exc:
+                self.ctx.logger.debug("解析抖音基本信息失败 (%s): %s", url, exc)
+                continue
+        return None
+
+    async def _fetch_douyin_chapters(self, vid: str, cookie_str: str) -> Optional[dict[str, Any]]:
+        """获取抖音视频章节要点（图1路径：从网页 SSR chapterInfo 提取）。"""
+        assert self._client is not None
+        url = f"https://www.douyin.com/jingxuan?modal_id={vid}"
+        headers = {
+            "User-Agent": _UA,
+            "Cookie": cookie_str,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        try:
+            resp = await self._client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return None
+            text = resp.text
+            pos = text.find('"chapterInfo"')
+            if pos == -1:
+                return None
+            start = text.find("{", pos)
+            depth, in_str, escape, end = 0, False, False, -1
+            for i in range(start, min(len(text), start + 30000)):
+                c = text[i]
+                if escape:
+                    escape = False
+                    continue
+                if c == "\\":
+                    escape = True
+                    continue
+                if c == '"':
+                    in_str = not in_str
+                    continue
+                if not in_str:
+                    if c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i + 1
+                            break
+            if end == -1:
+                return None
+            raw = text[start:end]
+            cleaned = raw.replace('\\\\\\"', '"').replace('\\\\"', '"').replace('\\"', '"')
+            cdata = json.loads(cleaned)
+            ch_list = []
+            for ch in cdata.get("list", []):
+                ms = ch.get("timestamp", 0)
+                ch_list.append({
+                    "time": _format_duration(ms // 1000),
+                    "desc": ch.get("desc", ""),
+                    "detail": ch.get("detail", ""),
+                })
+            return {
+                "chapterAbstract": cdata.get("chapterAbstract", ""),
+                "list": ch_list,
+            }
+        except Exception as exc:
+            self.ctx.logger.debug("提取抖音章节要点失败 (%s): %s", vid, exc)
+            return None
+
+    async def _fetch_douyin_ai_summary(self, vid: str, cookie_str: str) -> str:
+        """获取抖音官方AI视频总结（图2/3路径：从 AI 搜索流式接口提取）。"""
+        assert self._client is not None
+        if not cookie_str:
+            return ""
+
+        stream_url = "https://so-landing.douyin.com/douyin/select/v1/ai/stream/"
+        device_id = str(random.randint(7000000000000000000, 7999999999999999999))
+        params = {
+            "count": "5",
+            "cursor": "0",
+            "token": "search",
+            "ai_page_type": "ai_chat",
+            "search_channel": "aweme_ai_chat",
+            "enable_ai_tab_new_framework": "1",
+            "need_integration_card": "1",
+            "ai_chat_message_use_lynx": "1",
+            "version_code": "32.1.0",
+            "enter_method": "click_sug",
+            "enter_from": "general_search",
+            "search_type": "ai_chat_search",
+            "aid": "6383",
+            "device_id": device_id,
+            "keyword": "视频总结",
+            "ai_search_enter_from_group_id": vid,
+            "aweme_id": vid,
+        }
+        headers = {
+            "User-Agent": _UA,
+            "Cookie": cookie_str,
+            "Referer": "https://so-landing.douyin.com/search_ai_mobile/pc",
+            "Origin": "https://so-landing.douyin.com",
+            "Accept": "text/event-stream",
+        }
+        try:
+            async with self._client.stream("GET", stream_url, params=params, headers=headers, timeout=25.0) as resp:
+                if resp.status_code != 200:
+                    return ""
+                tokens: list[str] = []
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    try:
+                        d = json.loads(line[5:].strip())
+                        for item in d.get("data", []):
+                            display = item.get("display", {})
+                            disp_inner = display.get("display", {}) if isinstance(display, dict) else {}
+                            for span in disp_inner.get("generation_spans", []):
+                                text_obj = span.get("text", {})
+                                if isinstance(text_obj, dict) and "content" in text_obj:
+                                    tokens.append(text_obj["content"])
+                    except Exception:
+                        pass
+                return _clean_html_tags("".join(tokens))
+        except Exception as exc:
+            self.ctx.logger.debug("获取抖音AI总结流异常 (%s): %s", vid, exc)
+            return ""
+
+    async def _fetch_douyin_video_info(self, vid: str) -> Optional[dict[str, Any]]:
+        """获取抖音视频信息、章节要点与AI总结（带缓存）。"""
+        cache_key = f"douyin:{vid}"
+        now = time.time()
+        cached = self._video_cache.get(cache_key)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        assert self._douyin_cred_mgr is not None
+        await self._douyin_cred_mgr.ensure_ttwid()
+        cookie_str = self._douyin_cred_mgr.get_cookie_str()
+
+        # 1. 基础信息
+        basic_info = await self._fetch_douyin_basic_info(vid, cookie_str)
+        if not basic_info:
+            return None
+
+        result: dict[str, Any] = {
+            "vid": vid,
+            "title": basic_info.get("title", ""),
+            "author": basic_info.get("author", "未知创作者"),
+            "duration": basic_info.get("duration", 0),
+            "desc": basic_info.get("desc", "")[:200],
+            "chapters": [],
+            "chapter_abstract": "",
+            "ai_summary": "",
+        }
+
+        # 2. 章节要点与 AI 总结
+        if self.config.parse.enable_ai_summary:
+            chapters_task = asyncio.create_task(self._fetch_douyin_chapters(vid, cookie_str))
+            ai_summary_task = asyncio.create_task(self._fetch_douyin_ai_summary(vid, cookie_str))
+
+            try:
+                ch_data, summary = await asyncio.gather(chapters_task, ai_summary_task, return_exceptions=True)
+                if isinstance(ch_data, dict):
+                    result["chapters"] = ch_data.get("list", [])
+                    result["chapter_abstract"] = ch_data.get("chapterAbstract", "")
+                if isinstance(summary, str) and summary:
+                    result["ai_summary"] = summary
+            except Exception as exc:
+                self.ctx.logger.debug("获取抖音AI总结/章节异常 (%s): %s", vid, exc)
+
+        if len(self._video_cache) > 100:
+            self._video_cache.clear()
+        self._video_cache[cache_key] = (now + self.config.parse.cache_ttl_seconds, result)
+        return result
+
+    def _build_injected_douyin_summary(self, info: dict[str, Any]) -> str:
+        """构建附加到用户消息末尾的抖音视频信息、章节要点与AI总结块。"""
+        title = (info.get("title") or "").strip()
+        author = (info.get("author") or "未知创作者").strip()
+        duration = _format_duration(info.get("duration", 0))
+        chapters = info.get("chapters") or []
+        chapter_abstract = (info.get("chapter_abstract") or "").strip()
+        ai_summary = (info.get("ai_summary") or "").strip()
+
+        lines = [f"[抖音视频信息: 《{title}》 | 作者: @{author} | 时长: {duration}]"]
+        if chapters:
+            lines.append("[抖音章节要点]:")
+            if chapter_abstract:
+                lines.append(chapter_abstract)
+            for ch in chapters:
+                time_str = ch.get("time", "")
+                desc = ch.get("desc", "").strip()
+                detail = ch.get("detail", "").strip()
+                if detail:
+                    lines.append(f"- {time_str} {desc}: {detail}")
+                else:
+                    lines.append(f"- {time_str} {desc}")
+
+        if ai_summary:
+            lines.append(f"[抖音官方AI总结]:\n{ai_summary}")
+        elif not chapters and info.get("desc"):
+            lines.append(f"[视频简介]: {info['desc'].strip()}")
+
+        return "\n".join(lines)
+
+    def _build_douyin_tool_content(self, info: dict[str, Any]) -> str:
+        """构建返回给 planner 的抖音 Tool 内容。"""
+        lines = [
+            f"标题: {info.get('title', '')}",
+            f"作者: @{info.get('author', '未知创作者')}",
+            f"时长: {_format_duration(info.get('duration', 0))}",
+        ]
+        if info.get("desc") and info["desc"] != info.get("title"):
+            lines.append(f"简介: {info['desc']}")
+        chapters = info.get("chapters") or []
+        chapter_abstract = (info.get("chapter_abstract") or "").strip()
+        if chapters:
+            lines += ["", "抖音章节要点:"]
+            if chapter_abstract:
+                lines.append(chapter_abstract)
+            for ch in chapters:
+                t = ch.get("time", "")
+                d = ch.get("desc", "").strip()
+                det = ch.get("detail", "").strip()
+                lines.append(f"- {t} {d}: {det}" if det else f"- {t} {d}")
+        if info.get("ai_summary"):
+            lines += ["", "抖音官方AI总结:", info["ai_summary"]]
+        elif not chapters:
+            lines += ["", "(该视频暂无AI总结或章节，可从标题和简介理解内容)"]
+        if info.get("vid"):
+            lines.append(f"链接: https://www.douyin.com/video/{info['vid']}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ #
     # Hook: 拦截消息并在聊天上下文中附加AI总结（不自动发消息回复）
     # ------------------------------------------------------------------ #
 
     @HookHandler(
         "chat.receive.after_process",
         name="bilibili_summary_injector",
-        description="检测入站消息中的B站视频链接并将AI总结直接附加到消息内容中",
+        description="检测入站消息中的B站/抖音视频链接并将AI总结直接附加到消息内容中",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
         timeout_ms=10000,
@@ -501,31 +940,43 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
                         raw_parts.append(data)
             text = " ".join(raw_parts)
 
-        if not text or "[B站视频" in text:
+        if not text or "[B站视频" in text or "[抖音视频" in text:
             return {"action": "continue"}
 
         target = await self._resolve_target(text)
         if target is None:
             return {"action": "continue"}
 
-        try:
-            info = await self._fetch_video_info(target[0], target[1])
-        except Exception as exc:  # noqa: BLE001
-            self.ctx.logger.debug("获取视频总结异常: %s", exc)
-            return {"action": "continue"}
+        summary_block = ""
+        platform_kind, arg1 = target[0], target[1]
+        if platform_kind in ("bvid", "aid"):
+            try:
+                info = await self._fetch_video_info(platform_kind, arg1)
+                if info:
+                    summary_block = self._build_injected_summary(info)
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.debug("获取B站视频总结异常: %s", exc)
+                return {"action": "continue"}
+        elif platform_kind == "douyin":
+            if not cfg.enable_douyin:
+                return {"action": "continue"}
+            try:
+                info = await self._fetch_douyin_video_info(str(arg1))
+                if info:
+                    summary_block = self._build_injected_douyin_summary(info)
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.debug("获取抖音视频总结异常: %s", exc)
+                return {"action": "continue"}
 
-        if not info:
-            return {"action": "continue"}
-
-        summary_block = self._build_injected_summary(info)
         if not summary_block:
             return {"action": "continue"}
 
         self.ctx.logger.info(
-            "为消息 %s 附加B站视频AI总结 (%s=%s)",
+            "为消息 %s 附加%s视频AI总结 (%s=%s)",
             message.get("message_id"),
-            target[0],
-            target[1],
+            "B站" if platform_kind != "douyin" else "抖音",
+            platform_kind,
+            arg1,
         )
 
         current_plain = str(message.get("processed_plain_text") or "").strip()
@@ -568,7 +1019,7 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         if not link:
             return {"name": "parse_bilibili_video", "content": "参数 link 为空，无法解析。"}
         target = await self._resolve_target(link)
-        if target is None:
+        if target is None or target[0] not in ("bvid", "aid"):
             return {"name": "parse_bilibili_video", "content": f"无法从「{link}」中识别出B站视频。"}
         try:
             info = await self._fetch_video_info(target[0], target[1])
@@ -578,6 +1029,44 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         if info is None:
             return {"name": "parse_bilibili_video", "content": "获取视频信息失败，视频可能不存在或网络异常。"}
         return {"name": "parse_bilibili_video", "content": self._build_tool_content(info)}
+
+    @Tool(
+        "parse_douyin_video",
+        description=(
+            "解析抖音视频并获取抖音官方AI视频总结与章节要点。当聊天中出现抖音视频链接、"
+            "v.douyin.com 短链、分享口令文本，或有人提到想了解某个抖音视频内容时，调用此工具获取视频标题、"
+            "作者、时长、章节要点及AI总结，帮助你理解视频内容并参与讨论。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="link",
+                param_type=ToolParamType.STRING,
+                description="抖音视频分享链接、短链（如 https://v.douyin.com/xxxx/）、分享文本口令或19位视频ID",
+                required=True,
+            ),
+        ],
+    )
+    async def tool_parse_douyin_video(self, link: str = "", **kwargs: Any) -> dict[str, str]:
+        del kwargs
+        link = (link or "").strip()
+        if not link:
+            return {"name": "parse_douyin_video", "content": "参数 link 为空，无法解析。"}
+        target = await self._resolve_target(link)
+        if target is None or target[0] != "douyin":
+            # 兼容直接传入19位数字ID
+            m = re.search(r"\b(7\d{18})\b", link)
+            if m:
+                target = ("douyin", m.group(1))
+            else:
+                return {"name": "parse_douyin_video", "content": f"无法从「{link}」中识别出抖音视频。"}
+        try:
+            info = await self._fetch_douyin_video_info(str(target[1]))
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.error("解析抖音视频失败 (%s): %s", link, exc, exc_info=True)
+            return {"name": "parse_douyin_video", "content": f"解析抖音视频失败: {exc}"}
+        if info is None:
+            return {"name": "parse_douyin_video", "content": "获取抖音视频信息失败，视频可能不存在或网络异常。"}
+        return {"name": "parse_douyin_video", "content": self._build_douyin_tool_content(info)}
 
     # ------------------------------------------------------------------ #
     # Command: 登录管理与权限控制
@@ -665,7 +1154,7 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
 
     @Command(
         "cu_status",
-        description="查看B站登录状态",
+        description="查看B站与抖音凭据配置状态",
         pattern=r"^/cu[_\s]?status\s*$",
         aliases=["/cu状态", "/cu 状态"],
     )
@@ -673,7 +1162,11 @@ class ContentUnderstandingPlugin(MaiBotPlugin):
         del kwargs
         if self._cred_mgr is None:
             return False, "插件未就绪", 0
-        message = await self._cred_mgr.get_status()
+        bili_msg = await self._cred_mgr.get_status()
+        douyin_status = "未配置 Cookie"
+        if self._douyin_cred_mgr and self._douyin_cred_mgr.get_cookie_str():
+            douyin_status = "已配置 Cookie（AI总结与章节要点已可用）"
+        message = f"【B站状态】{bili_msg}\n【抖音状态】{douyin_status}"
         if stream_id:
             await self.ctx.send.text(message, stream_id)
         return True, message, 2
