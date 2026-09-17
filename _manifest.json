@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "id": "yukisakiko.content-understanding-plugin",
+  "id": "YukiSakiko.content_understanding_plugin",
   "name": "麦麦b站内容理解插件",
   "version": "2.0.0",
   "description": "自动识别聊天中的B站视频链接与小程序卡片，获取视频信息与B站官方AI总结并附加到上下文，辅助麦麦更好地参与聊天",
